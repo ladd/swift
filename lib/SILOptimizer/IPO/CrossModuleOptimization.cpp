@@ -536,6 +536,33 @@ bool CrossModuleOptimization::canSerializeFunction(
   if (!function->isDefinition() || function->isAvailableExternally())
     return false;
 
+  // Don't serialize a function whose type mentions an opaque result type that
+  // an importing module would not be able to look through. In the defining
+  // module the opaque type is substituted with its (locally visible) underlying
+  // type, so the body is lowered against the concrete type. But if the
+  // underlying type isn't substitutable across the module boundary (e.g. it
+  // contains a non-public type), an importer keeps the result opaque, and the
+  // deserialized body's entry-block indirect result argument (concrete) no
+  // longer matches the function's result type (opaque) -- malformed SIL that
+  // trips the verifier / crashes the optimizer.
+  //
+  // Package CMO handles opaque results separately (importers within the package
+  // can look through them), so this restriction only applies outside of it.
+  if (!isPackageCMOEnabled(M.getSwiftModule())) {
+    if (auto loweredTy = function->getLoweredFunctionType()) {
+      if (loweredTy->hasOpaqueArchetype()) {
+        // Simulate an importer's view: minimal resilience, not whole-module.
+        TypeExpansionContext importerContext(
+            ResilienceExpansion::Minimal, M.getSwiftModule(),
+            /*isWholeModuleContext=*/false);
+        auto substTy = substOpaqueTypesWithUnderlyingTypes(
+            CanType(loweredTy), importerContext);
+        if (substTy->hasOpaqueArchetype())
+          return false;
+      }
+    }
+  }
+
   // Avoid a stack overflow in case of a very deeply nested call graph.
   if (maxDepth <= 0)
     return false;
